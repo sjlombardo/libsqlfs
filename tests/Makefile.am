@@ -20,10 +20,12 @@ check_SCRIPTS = \
 check_PROGRAMS = \
 	c_api \
 	c_thread_api \
-	fsx
+	fsx \
+	c_perf
 
 c_api_SOURCES = c_api.c
 c_thread_api_SOURCES = c_thread_api.c
+c_perf_SOURCES = c_perf.c
 fsx_SOURCES = fsx.c
 
 if WITH_SQLCIPHER
