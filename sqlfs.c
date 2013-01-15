@@ -99,7 +99,7 @@ created by
     DONE_PREPARE
 
 
-static const int BLOCK_SIZE = 128 * 1024;
+static const int BLOCK_SIZE = 8 * 1024;
 
 static pthread_key_t sql_key;
 
@@ -3292,6 +3292,7 @@ static void * sqlfs_t_init(const char *db_file, const char *db_key)
             fprintf(stderr, "Opening the database with provided key failed.\n");
             return 0;
         }
+        sqlite3_exec(sql_fs->db, "PRAGMA cipher_page_size = 8192;", NULL, NULL, NULL);
     }
 #endif
 
