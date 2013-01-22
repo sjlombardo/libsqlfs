@@ -99,7 +99,7 @@ created by
     DONE_PREPARE
 
 
-static const int BLOCK_SIZE = 8 * 1024;
+static const int BLOCK_SIZE = 8192;
 
 static pthread_key_t sql_key;
 
@@ -175,6 +175,19 @@ static __inline__ char *make_str_copy(const char *str)
     return strdup(str);
 }
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#define LOG_TAG "libsqlfs"
+#define  LOGW(...)  __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+static void show_msg(FILE *f, char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    __android_log_print(ANDROID_LOG_WARN, LOG_TAG, fmt, ap);
+    va_end(ap);
+}
+#else
 static void show_msg(FILE *f, char *fmt, ...)
 {
     va_list ap;
@@ -184,6 +197,7 @@ static void show_msg(FILE *f, char *fmt, ...)
     vfprintf(f, fmt, ap);
     va_end(ap);
 }
+#endif /* __ANDROID__ */
 
 
 
@@ -201,8 +215,19 @@ void clean_value(key_value *value)
     memset(value, 0, sizeof(*value));
 }
 
-/*static pthread_mutex_t transaction_lock = PTHREAD_MUTEX_INITIALIZER;
-*/
+
+/* There are a few different locking techniques in the code still, some
+ * commented out, and really only one in use: the sqlite 'begin exclusive'.
+ * There is a pthread mutex lock below that is quite large grained. Then in
+ * sqlfs_t_init, there is the sqlite3_busy_timeout(), which is there to help
+ * ensure that the call to create "/" if it doesn't exist doesn't fail.
+ *
+ * Originally, 'begin exclusive' was only used in LIBFUSE mode, and not in
+ * standalone library mode, where 'begin' was used.  But we found it too
+ * unreliable so we switched standalone mode to also use 'begin exclusive'.
+ */
+
+//static pthread_mutex_t transaction_lock = PTHREAD_MUTEX_INITIALIZER;
 #define TRANS_LOCK //pthread_mutex_lock(&transaction_lock);
 #define TRANS_UNLOCK //pthread_mutex_unlock(&transaction_lock);
 
@@ -213,12 +238,10 @@ void clean_value(key_value *value)
 static int begin_transaction(sqlfs_t *sqlfs)
 {
     int i;
-#ifdef HAVE_LIBFUSE
+    /* TODO use better locking techniques to provide more concurrency:
+     * http://www.sqlite.org/lockingv3.html
+     * http://www.sqlite.org/wal.html  */
     const char *cmd = "begin exclusive;";
-
-#else
-    const char *cmd = "begin;";
-#endif
 
     sqlite3_stmt *stmt;
     const char *tail;
@@ -494,7 +517,7 @@ static int key_is_dir(sqlfs_t *sqlfs, const char *key)
 
     else
     {
-        t = sqlite3_column_text(stmt, 0);
+        t = (const char *)sqlite3_column_text(stmt, 0);
 
         if (t && !strcmp(TYPE_DIR, t))
             result = 1;
@@ -928,7 +951,7 @@ static int get_dir_children_num(sqlfs_t *sqlfs, const char *path)
             r = sql_step(stmt);
             if (r == SQLITE_ROW)
             {
-                t = sqlite3_column_text(stmt, 0);
+                t = (const char *)sqlite3_column_text(stmt, 0);
                 t2 = t + strlen(tmp) - 1;
                 if (strchr(t2, '/'))
                     continue; /* grand child, etc. */
@@ -1146,9 +1169,9 @@ static int get_attr(sqlfs_t *sqlfs, const char *key, key_attr *attr)
     }
     else
     {
-        attr->path = make_str_copy(sqlite3_column_text(stmt, 0));
+        attr->path = make_str_copy((const char *)sqlite3_column_text(stmt, 0));
         assert(!strcmp(key, attr->path));
-        attr->type = make_str_copy(sqlite3_column_text(stmt, 1));
+        attr->type = make_str_copy((const char *)sqlite3_column_text(stmt, 1));
         attr->mode = (sqlite3_column_int(stmt, 2));
         attr->uid = (sqlite3_column_int(stmt, 3));
         attr->gid = (sqlite3_column_int(stmt, 4));
@@ -1429,7 +1452,7 @@ static int get_value(sqlfs_t *sqlfs, const char *key, key_value *value, size_t b
     const char *tail;
     sqlite3_stmt *stmt;
     static const char *cmd = "select size from meta_data where key = :key; ";
-    size_t size;
+    size_t size = 0;
     int block_no;
 
     clean_value(value);
@@ -1448,7 +1471,6 @@ static int get_value(sqlfs_t *sqlfs, const char *key, key_value *value, size_t b
     {
         if (r != SQLITE_DONE)
             show_msg(stderr, "%s\n", sqlite3_errmsg(get_sqlfs(sqlfs)->db));
-
     }
     else
     {
@@ -1471,7 +1493,6 @@ static int get_value(sqlfs_t *sqlfs, const char *key, key_value *value, size_t b
             begin = (block_no = (begin / BLOCK_SIZE)) * BLOCK_SIZE;
             for ( ; begin < end; begin += BLOCK_SIZE, block_no++)
             {
-
                 r = get_value_block(sqlfs, key, value->data + begin - value->offset, block_no, NULL);
                 if (r != SQLITE_OK)
                     break;
@@ -1705,19 +1726,19 @@ static int check_parent_access(sqlfs_t *sqlfs, const char *path)
 
     BEGIN
     r = get_parent_path(path, ppath);
-//fprintf(stderr, "%s #1 returns %d on %s\n", __func__, r, path);//???
+//show_msg(stderr, "%s #1 returns %d on %s\n", __func__, r, path);//???
     if (r == SQLITE_OK)
     {
         result = check_parent_access(sqlfs, ppath);
-//fprintf(stderr, "%s #2 returns %d on %s\n", __func__, result, path);//???
+//show_msg(stderr, "%s #2 returns %d on %s\n", __func__, result, path);//???
         if (result == 0)
             result = (sqlfs_proc_access(sqlfs, (ppath), X_OK));
-//fprintf(stderr, "%s #3 returns %d on %s %s\n", __func__, result, path, ppath);//???
+//show_msg(stderr, "%s #3 returns %d on %s %s\n", __func__, result, path, ppath);//???
     }
     /* else if no parent, we return 0 by default */
 
     COMPLETE(1)
-//fprintf(stderr, "%s returns %d on %s\n", __func__, result, path);//???
+//show_msg(stderr, "%s returns %d on %s\n", __func__, result, path);//???
     return result;
 }
 
@@ -1733,9 +1754,11 @@ static int check_parent_write(sqlfs_t *sqlfs, const char *path)
     if (r == SQLITE_OK)
     {
         result = (sqlfs_proc_access(sqlfs, (ppath), W_OK | X_OK));
-//fprintf(stderr, "check directory write 1st %s %d uid %d gid %d\n",   ppath, result, get_sqlfs(sqlfs)->uid, get_sqlfs(sqlfs)->gid);//???
+//show_msg(stderr, "check directory write 1st %s %d uid %d gid %d\n",   ppath, result, get_sqlfs(sqlfs)->uid, get_sqlfs(sqlfs)->gid);//???
 
 #ifndef HAVE_LIBFUSE
+        /* libfuse seems to enforce that the parent directory before getting
+         * here, but without libfuse, we need to do it manually */
         if (result == -ENOENT)
         {
             result = check_parent_write(sqlfs, ppath);
@@ -1746,7 +1769,7 @@ static int check_parent_write(sqlfs_t *sqlfs, const char *path)
 #endif
     }
     COMPLETE(1)
-//fprintf(stderr, "check directory write %s %d\n",   ppath, result);//???
+//show_msg(stderr, "check directory write %s %d\n",   ppath, result);//???
     return result;
 }
 
@@ -1756,7 +1779,7 @@ static int check_parent_write(sqlfs_t *sqlfs, const char *path)
 #define CHECK_WRITE(p) result = (sqlfs_proc_access(sqlfs, (p), W_OK | F_OK));  if (result != 0) { COMPLETE(1); return result; }
 
 #define CHECK_DIR_WRITE(p) result = (sqlfs_proc_access(sqlfs, (p), W_OK | F_OK | X_OK));  if (result != 0) { COMPLETE(1); return result; }
-#define CHECK_DIR_READ(p) result = (sqlfs_proc_access(sqlfs, (p), R_OK | F_OK | X_OK));  if (result != 0) {fprintf(stderr, "dir read failed %d\n", result); COMPLETE(1); return result; }
+#define CHECK_DIR_READ(p) result = (sqlfs_proc_access(sqlfs, (p), R_OK | F_OK | X_OK));  if (result != 0) {show_msg(stderr, "dir read failed %d\n", result); COMPLETE(1); return result; }
 
 #define CHECK_PARENT_READ(p)  \
   { char ppath[PATH_MAX]; if (SQLITE_OK == get_parent_path((p), ppath))  {  result = (sqlfs_proc_access(sqlfs, (ppath), R_OK | X_OK));  if (result != 0) { COMPLETE(1); return result; }}}
@@ -1851,7 +1874,7 @@ int sqlfs_proc_access(sqlfs_t *sqlfs, const char *path, int mask)
             result = -EBUSY;
 
         COMPLETE(1)
-        //fprintf(stderr, "root access returns %d on %s\n", result, path);//???
+        //show_msg(stderr, "root access returns %d on %s\n", result, path);//???
         return result;
     }
 
@@ -1891,7 +1914,7 @@ int sqlfs_proc_access(sqlfs_t *sqlfs, const char *path, int mask)
 
     if (result == 0)
         r = get_permission_data(get_sqlfs(sqlfs), path, &fgid, &fuid, &fmode);
-    //fprintf(stderr, "get permission returns %d\n", r);//???
+    //show_msg(stderr, "get permission returns %d\n", r);//???
     if ((r == SQLITE_OK) && (result == 0))
     {
         if (uid == (uid_t) fuid)
@@ -2023,7 +2046,7 @@ int sqlfs_proc_readdir(sqlfs_t *sqlfs, const char *path, void *buf, fuse_fill_di
             r = sql_step(stmt);
             if (r == SQLITE_ROW)
             {
-                t = sqlite3_column_text(stmt, 0);
+                t = (const char *)sqlite3_column_text(stmt, 0);
                 if (!strcmp(t, lpath))
                     continue;
                 t2 = t + strlen(lpath) + 1;
@@ -2286,7 +2309,7 @@ static int rename_dir_children(sqlfs_t *sqlfs, const char *old, const char *new)
             r = sql_step(stmt);
             if (r == SQLITE_ROW)
             {
-                child_path = sqlite3_column_text(stmt, 0);
+                child_path = (const char *)sqlite3_column_text(stmt, 0);
                 if (!strcmp(child_path, lpath))
                     continue;
                 child_filename = child_path + strlen(lpath) + 1;
@@ -2296,9 +2319,9 @@ static int rename_dir_children(sqlfs_t *sqlfs, const char *old, const char *new)
                 /*printf("\n\tfound: %s, %s\n", child_path, child_filename);*/
 
                 char new_path[PATH_MAX];
-                strncpy(&new_path, rpath, PATH_MAX);
-                strncat(&new_path, "/", 1);
-                strncat(&new_path, child_filename, PATH_MAX);
+                strncpy(new_path, rpath, PATH_MAX);
+                strncat(new_path, "/", 1);
+                strncat(new_path, child_filename, PATH_MAX - strlen(new_path) - 1);
 
                 /*printf("\tnew path: %s\n", new_path);*/
 
@@ -2973,7 +2996,7 @@ int sqlfs_proc_fsync(sqlfs_t *sqlfs, const char *path, int isfdatasync, struct f
     return 0;
 }
 
-/* xattr operations are optional and can safely be left unimplemented */
+/* xattr operations are optional and can safely be left unimplemented
 int sqlfs_proc_setxattr(sqlfs_t *sqlfs, const char *path, const char *name, const char *value,
                         size_t size, int flags)
 {
@@ -2995,7 +3018,7 @@ int sqlfs_proc_removexattr(sqlfs_t *sqlfs, const char *path, const char *name)
 {
     return -ENOSYS;
 }
-
+*/
 
 int sqlfs_del_tree(sqlfs_t *sqlfs, const char *key)
 {
@@ -3108,7 +3131,7 @@ int sqlfs_get_attr(sqlfs_t *sqlfs, const char *key, key_attr *attr)
             r = -1;
     }
     COMPLETE(1)
-//fprintf(stderr, "return %d on %s\n", r, key);//???
+//show_msg(stderr, "return %d on %s\n", r, key);//???
     return r;
 
 }
@@ -3214,7 +3237,7 @@ int sqlfs_list_keys(sqlfs_t *sqlfs, const char *pattern, void *buf, fuse_fill_di
             r = sql_step(stmt);
             if (r == SQLITE_ROW)
             {
-                t = sqlite3_column_text(stmt, 0);
+                t = (const char *)sqlite3_column_text(stmt, 0);
                 if (filler(buf, t, NULL, 0))
                     break;
             }
@@ -3279,7 +3302,7 @@ static void * sqlfs_t_init(const char *db_file, const char *db_key)
     r = sqlite3_open(db_file, &(sql_fs->db));
     if (r != SQLITE_OK)
     {
-        fprintf(stderr, "Cannot open the database file %s\n", db_file);
+        show_msg(stderr, "Cannot open the database file %s\n", db_file);
         return 0;
     }
 
@@ -3289,7 +3312,7 @@ static void * sqlfs_t_init(const char *db_file, const char *db_key)
         r = sqlite3_key(sql_fs->db, db_key, strlen(db_key));
         if (r != SQLITE_OK)
         {
-            fprintf(stderr, "Opening the database with provided key failed.\n");
+            show_msg(stderr, "Opening the database with provided key failed.\n");
             return 0;
         }
         sqlite3_exec(sql_fs->db, "PRAGMA cipher_page_size = 8192;", NULL, NULL, NULL);
@@ -3303,6 +3326,9 @@ static void * sqlfs_t_init(const char *db_file, const char *db_key)
     if (max_inode == 0)
         max_inode = get_current_max_inode(sql_fs);
 
+    /* When using the 'begin' sqlite3 locking mode, this busy timeout is
+     * necessary to make sure that the call to ensure_existence succeeds when
+     * the filesystem is under load. With 'begin exclusive' its not needed. */
     // TODO Investigate this busy_timeout function, it proved useful in preventing permanent EBUSY errors
     /*sqlite3_busy_timeout( sql_fs->db, 500); *//* default timeout 0.5 seconds */
     sqlite3_exec(sql_fs->db, "PRAGMA synchronous = OFF;", NULL, NULL, NULL);
@@ -3457,6 +3483,7 @@ static int sqlfs_op_fsync(const char *path, int isfdatasync, struct fuse_file_in
 {
     return sqlfs_proc_fsync(0, path, isfdatasync, fi);
 }
+/* the xaddr functions are optional and can safely be left unimplemented
 static int sqlfs_op_setxattr(const char *path, const char *name, const char *value,
                              size_t size, int flags)
 {
@@ -3474,6 +3501,7 @@ static int sqlfs_op_removexattr(const char *path, const char *name)
 {
     return sqlfs_proc_removexattr(0, path, name);
 }
+*/
 
 static struct fuse_operations sqlfs_op;
 
@@ -3504,13 +3532,12 @@ int sqlfs_init(const char *db_file_name)
     sqlfs_op.statfs	= sqlfs_op_statfs;
     sqlfs_op.release	= sqlfs_op_release;
     sqlfs_op.fsync	= sqlfs_op_fsync;
-#if 0
-
+/* the xaddr functions are optional and can safely be left unimplemented
     sqlfs_op.setxattr	= sqlfs_op_setxattr;
     sqlfs_op.getxattr	= sqlfs_op_getxattr;
     sqlfs_op.listxattr	= sqlfs_op_listxattr;
     sqlfs_op.removexattr= sqlfs_op_removexattr;
-#endif
+*/
 #endif
 
     if (db_file_name)
