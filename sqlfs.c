@@ -235,6 +235,16 @@ void clean_value(key_value *value)
 #undef INDEX
 #define INDEX 100
 
+static pthread_mutex_t checkpoint_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_rwlock_t checkpoint_lock;
+static int tx_checkpoint_count = 0;
+static int checkpoint_lock_init = 0;
+static pthread_rwlockattr_t checkpoint_attr;
+#define CHECKPOINT_COUNT 500
+#define CHECKPOINT_READ_WAIT 5
+#define CHECKPOINT_WRITE_WAIT 5
+
+
 static int begin_transaction(sqlfs_t *sqlfs)
 {
     int i;
@@ -278,7 +288,6 @@ static int begin_transaction(sqlfs_t *sqlfs)
 
 #undef INDEX
 #define INDEX 101
-
 
 static int commit_transaction(sqlfs_t *sqlfs, int r0)
 {
@@ -331,6 +340,29 @@ static int commit_transaction(sqlfs_t *sqlfs, int r0)
         }
         //**assert(sqlite3_get_autocommit(get_sqlfs(sqlfs)->db) != 0);*/
         get_sqlfs(sqlfs)->in_transaction = 0;
+        
+        /* every CHECKPOINT_COUNT committed transactions, run a
+           non-passive checkpoint */
+
+        pthread_mutex_lock(&checkpoint_mutex);
+        if(tx_checkpoint_count++ > CHECKPOINT_COUNT) {
+          struct timespec delay;
+          clock_gettime(CLOCK_REALTIME, &delay);
+          delay.tv_sec += CHECKPOINT_WRITE_WAIT;
+          if(pthread_rwlock_timedwrlock(&checkpoint_lock, &delay) == 0) {
+            int log, ckpt, rc;
+            rc = sqlite3_wal_checkpoint_v2(get_sqlfs(sqlfs)->db, NULL, SQLITE_CHECKPOINT_RESTART, &log, &ckpt);
+            show_msg(stderr, "checkpoint result=%d, wal frames=%d, checkpointed frames=%d\n", rc, log, ckpt);
+            if(rc == 0) {
+              tx_checkpoint_count = 0;
+            }
+            pthread_rwlock_unlock(&checkpoint_lock);
+          } else {
+            show_msg(stderr, "unable to obtain checkpoint writelock\n");
+          }
+        }
+        pthread_mutex_unlock(&checkpoint_mutex);
+
     }
     get_sqlfs(sqlfs)->transaction_level--;
 
@@ -1141,6 +1173,12 @@ static int get_attr(sqlfs_t *sqlfs, const char *key, key_attr *attr)
     sqlite3_stmt *stmt;
     static const char *cmd = "select key, type, mode, uid, gid, atime, mtime, ctime, size, inode from meta_data where key = :key; ";
 
+    struct timespec delay;
+    int lock_rc;
+    clock_gettime(CLOCK_REALTIME, &delay);
+    delay.tv_sec += CHECKPOINT_READ_WAIT;
+    lock_rc = pthread_rwlock_timedrdlock(&checkpoint_lock, &delay);
+
     clean_attr(attr);
     SQLITE3_PREPARE(get_sqlfs(sqlfs)->db, cmd, -1, &stmt,  &tail);
     if (r != SQLITE_OK)
@@ -1182,6 +1220,8 @@ static int get_attr(sqlfs_t *sqlfs, const char *key, key_attr *attr)
 
     sqlite3_reset(stmt);
     key_accessed(sqlfs, key);
+    if(lock_rc == 0) 
+      pthread_rwlock_unlock(&checkpoint_lock);
     return r;
 
 }
@@ -1311,7 +1351,13 @@ static int get_value_block(sqlfs_t *sqlfs, const char *key, char *data, int bloc
     sqlite3_stmt *stmt;
     static const char *cmd = "select data_block from value_data where key = :key and block_no = :block_no;";
     key_attr attr = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } ;
+    struct timespec delay;
+    int lock_rc;
+    clock_gettime(CLOCK_REALTIME, &delay);
+    delay.tv_sec += CHECKPOINT_READ_WAIT;
+    lock_rc = pthread_rwlock_timedrdlock(&checkpoint_lock, &delay);
     clean_attr(&attr);
+
     SQLITE3_PREPARE(get_sqlfs(sqlfs)->db, cmd, -1, &stmt,  &tail);
     if (r != SQLITE_OK)
     {
@@ -1337,6 +1383,8 @@ static int get_value_block(sqlfs_t *sqlfs, const char *key, char *data, int bloc
     }
 
     sqlite3_reset(stmt);
+    if(lock_rc == 0) 
+      pthread_rwlock_unlock(&checkpoint_lock);
 
     return r;
 
@@ -3286,11 +3334,18 @@ static int create_db_table(sqlfs_t *sqlfs)
 }
 
 
-
 static void * sqlfs_t_init(const char *db_file, const char *db_key)
 {
     int i, r;
     sqlfs_t *sql_fs = calloc(1, sizeof(*sql_fs));
+
+    if(checkpoint_lock_init == 0) {
+      pthread_rwlockattr_init(&checkpoint_attr);
+      pthread_rwlockattr_setpshared(&checkpoint_attr, PTHREAD_PROCESS_PRIVATE); 
+      pthread_rwlock_init(&checkpoint_lock, &checkpoint_attr);
+      checkpoint_lock_init = 1;
+    }
+
     assert(sql_fs);
     for (i = 0; i < (int)(sizeof(sql_fs->stmts) / sizeof(sql_fs->stmts[0])); i++)
     {
@@ -3319,6 +3374,7 @@ static void * sqlfs_t_init(const char *db_file, const char *db_key)
      * written to disk one time) and improves concurrency by reducing blocking between
      * readers and writers */
     sqlite3_exec(sql_fs->db, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
+    sqlite3_exec(sql_fs->db, "PRAGMA PRAGMA wal_autocheckpoint = 0;", NULL, NULL, NULL);
 
     /* WAL mode only performs fsync on checkpoint operation, which reduces overhead
      * It should make it possible to run with synchronous set to NORMAL with less
